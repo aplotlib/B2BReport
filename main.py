@@ -331,25 +331,41 @@ def process_single_row(row_data, ai_handler):
     sku_empty = pd.isna(row[col_sku]) or str(row[col_sku]).strip() == ''
     reason_empty = pd.isna(row[col_reason]) or str(row[col_reason]).strip() == ''
     
-    result = {'index': idx, 'processed': False}
+    result = {'index': idx, 'processed': False, 'sku_confidence': 0.0, 'reason_confidence': 0.0}
     
     if sku_empty or reason_empty:
         description = row[col_description] if col_description else ''
         
         if sku_empty:
-            result['sku'] = extract_sku_from_description(description, ai_handler)
+            if hasattr(ai_handler, 'extract_sku_enhanced'):
+                sku, confidence = ai_handler.extract_sku_enhanced(description)
+                result['sku'] = sku
+                result['sku_confidence'] = confidence
+            else:
+                result['sku'] = extract_sku_from_description(description, ai_handler)
+                result['sku_confidence'] = 0.8 if result['sku'] else 0.0
         else:
             result['sku'] = row[col_sku]
+            result['sku_confidence'] = 1.0
             
         if reason_empty:
-            result['reason'] = extract_reason_from_description(description, ai_handler)
+            if hasattr(ai_handler, 'extract_reason_enhanced'):
+                reason, confidence = ai_handler.extract_reason_enhanced(description)
+                result['reason'] = reason
+                result['reason_confidence'] = confidence
+            else:
+                result['reason'] = extract_reason_from_description(description, ai_handler)
+                result['reason_confidence'] = 0.8 if result['reason'] != 'Other' else 0.3
         else:
             result['reason'] = row[col_reason]
+            result['reason_confidence'] = 1.0
             
         result['processed'] = True
     else:
         result['sku'] = row[col_sku]
         result['reason'] = row[col_reason]
+        result['sku_confidence'] = 1.0
+        result['reason_confidence'] = 1.0
     
     return result
 
@@ -488,8 +504,303 @@ def process_excel_file_optimized(file, report_type, sheets_to_process):
     
     return all_processed_dfs, total_rows_processed, total_successful
 
-def main():
-    initialize_session_state()
+def analyze_product_data(all_processed_dfs):
+    """Perform comprehensive product analysis on processed data"""
+    # Combine all data
+    combined_df = pd.concat(all_processed_dfs, ignore_index=True)
+    
+    # Get column names (assuming standard positions)
+    col_sku = combined_df.columns[2] if len(combined_df.columns) > 2 else 'SKU'
+    col_reason = combined_df.columns[3] if len(combined_df.columns) > 3 else 'Reason'
+    
+    # Filter valid SKUs
+    valid_data = combined_df[
+        (combined_df[col_sku].notna()) & 
+        (combined_df[col_sku] != '') &
+        (combined_df[col_reason].notna()) &
+        (combined_df[col_reason] != '')
+    ].copy()
+    
+    if len(valid_data) == 0:
+        return None
+    
+    # Product-level analysis
+    product_analysis = {}
+    
+    for sku in valid_data[col_sku].unique():
+        sku_data = valid_data[valid_data[col_sku] == sku]
+        
+        # Calculate metrics
+        total_returns = len(sku_data)
+        reason_breakdown = sku_data[col_reason].value_counts().to_dict()
+        
+        # Quality score (inverse of problem severity)
+        quality_issues = sum(count for reason, count in reason_breakdown.items() 
+                           if reason.lower() in ['defective', 'defective/quality', 'quality issue', 
+                                                'broken', 'not working', 'missing parts'])
+        quality_score = 100 * (1 - (quality_issues / total_returns))
+        
+        # Risk level
+        if quality_score < 70:
+            risk_level = "High"
+        elif quality_score < 85:
+            risk_level = "Medium"
+        else:
+            risk_level = "Low"
+        
+        # Most common issues
+        top_issues = sorted(reason_breakdown.items(), key=lambda x: x[1], reverse=True)[:3]
+        
+        product_analysis[sku] = {
+            'total_returns': total_returns,
+            'reason_breakdown': reason_breakdown,
+            'quality_score': quality_score,
+            'risk_level': risk_level,
+            'top_issues': top_issues,
+            'defect_rate': (quality_issues / total_returns * 100),
+            'primary_issue': top_issues[0][0] if top_issues else 'Unknown'
+        }
+    
+    # Sort by total returns (most problematic first)
+    sorted_products = sorted(product_analysis.items(), 
+                           key=lambda x: x[1]['total_returns'], 
+                           reverse=True)
+    
+    return {
+        'product_details': dict(sorted_products),
+        'total_products': len(product_analysis),
+        'high_risk_products': sum(1 for p in product_analysis.values() if p['risk_level'] == 'High'),
+        'avg_quality_score': sum(p['quality_score'] for p in product_analysis.values()) / len(product_analysis)
+    }
+
+def generate_product_recommendations(product_data):
+    """Generate actionable recommendations for each product"""
+    recommendations = {}
+    
+    for sku, data in product_data.items():
+        recs = []
+        
+        # Quality-based recommendations
+        if data['defect_rate'] > 30:
+            recs.append({
+                'priority': 'HIGH',
+                'action': 'Quality Review',
+                'detail': f"Urgent: {data['defect_rate']:.1f}% defect rate. Initiate quality control review with supplier."
+            })
+        
+        # Issue-specific recommendations
+        primary_issue = data['primary_issue'].lower()
+        
+        if 'size' in primary_issue or 'fit' in primary_issue:
+            recs.append({
+                'priority': 'MEDIUM',
+                'action': 'Size Guide Update',
+                'detail': 'Update product listings with clearer size information and measurement guides.'
+            })
+        
+        if 'comfort' in primary_issue:
+            recs.append({
+                'priority': 'MEDIUM',
+                'action': 'Product Design Review',
+                'detail': 'Review ergonomic design and material choices. Consider customer feedback for improvements.'
+            })
+        
+        if 'missing' in primary_issue:
+            recs.append({
+                'priority': 'HIGH',
+                'action': 'Packaging Audit',
+                'detail': 'Audit packaging process to ensure all components are included. Update quality checklist.'
+            })
+        
+        if 'difficult' in primary_issue or 'hard to use' in primary_issue:
+            recs.append({
+                'priority': 'MEDIUM',
+                'action': 'Instructions Review',
+                'detail': 'Improve product instructions. Consider video tutorials or clearer diagrams.'
+            })
+        
+        if 'wrong' in primary_issue:
+            recs.append({
+                'priority': 'MEDIUM',
+                'action': 'Listing Accuracy',
+                'detail': 'Review product listings for accuracy. Ensure images and descriptions match actual product.'
+            })
+        
+        # General recommendation based on volume
+        if data['total_returns'] > 10:
+            recs.append({
+                'priority': 'LOW',
+                'action': 'Customer Feedback',
+                'detail': f"Collect detailed feedback from {data['total_returns']} returns to identify improvement opportunities."
+            })
+        
+        recommendations[sku] = recs
+    
+    return recommendations
+
+def display_product_analysis(analysis_data, recommendations):
+    """Display comprehensive product analysis dashboard"""
+    st.markdown("### 📊 Product Analysis Dashboard")
+    
+    # Overview metrics
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric("Total Products", analysis_data['total_products'])
+    
+    with col2:
+        st.metric("High Risk Products", analysis_data['high_risk_products'],
+                 help="Products with quality score < 70%")
+    
+    with col3:
+        st.metric("Avg Quality Score", f"{analysis_data['avg_quality_score']:.1f}%")
+    
+    with col4:
+        total_returns = sum(p['total_returns'] for p in analysis_data['product_details'].values())
+        st.metric("Total Returns Analyzed", total_returns)
+    
+    # Top problematic products
+    st.markdown("---")
+    st.markdown("### 🚨 Top 10 Problematic Products")
+    
+    top_products = list(analysis_data['product_details'].items())[:10]
+    
+    for idx, (sku, data) in enumerate(top_products):
+        with st.expander(f"#{idx+1} - SKU: {sku} ({data['total_returns']} returns)", 
+                        expanded=(idx < 3)):  # Expand top 3
+            
+            # Product metrics
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                # Quality score with color coding
+                score_color = "#28a745" if data['quality_score'] >= 85 else "#ffc107" if data['quality_score'] >= 70 else "#dc3545"
+                st.markdown(f"""
+                <div style="text-align: center; padding: 1rem; background: {score_color}20; border-radius: 8px; border: 2px solid {score_color};">
+                    <h2 style="margin: 0; color: {score_color};">{data['quality_score']:.0f}%</h2>
+                    <p style="margin: 0;">Quality Score</p>
+                </div>
+                """, unsafe_allow_html=True)
+            
+            with col2:
+                st.metric("Risk Level", data['risk_level'])
+                st.metric("Defect Rate", f"{data['defect_rate']:.1f}%")
+            
+            with col3:
+                st.metric("Total Returns", data['total_returns'])
+                st.metric("Primary Issue", data['primary_issue'])
+            
+            # Reason breakdown
+            st.markdown("#### Return Reason Breakdown")
+            
+            # Create visual breakdown
+            reason_df = pd.DataFrame(list(data['reason_breakdown'].items()), 
+                                   columns=['Reason', 'Count'])
+            reason_df['Percentage'] = (reason_df['Count'] / reason_df['Count'].sum() * 100).round(1)
+            reason_df = reason_df.sort_values('Count', ascending=False)
+            
+            # Display as styled table
+            st.dataframe(reason_df, use_container_width=True, hide_index=True)
+            
+            # Recommendations
+            if sku in recommendations and recommendations[sku]:
+                st.markdown("#### 💡 Recommended Actions")
+                
+                for rec in recommendations[sku]:
+                    priority_color = {
+                        'HIGH': '#dc3545',
+                        'MEDIUM': '#ffc107',
+                        'LOW': '#28a745'
+                    }.get(rec['priority'], '#6c757d')
+                    
+                    st.markdown(f"""
+                    <div style="padding: 0.75rem; margin: 0.5rem 0; border-left: 4px solid {priority_color}; background: #f8f9fa;">
+                        <strong style="color: {priority_color};">[{rec['priority']}] {rec['action']}</strong><br>
+                        {rec['detail']}
+                    </div>
+                    """, unsafe_allow_html=True)
+    
+    # Category analysis
+    st.markdown("---")
+    st.markdown("### 📈 Return Reason Distribution")
+    
+    # Aggregate all reasons
+    all_reasons = {}
+    for product in analysis_data['product_details'].values():
+        for reason, count in product['reason_breakdown'].items():
+            all_reasons[reason] = all_reasons.get(reason, 0) + count
+    
+    # Sort and display
+    sorted_reasons = sorted(all_reasons.items(), key=lambda x: x[1], reverse=True)
+    
+    reason_df = pd.DataFrame(sorted_reasons, columns=['Reason', 'Count'])
+    reason_df['Percentage'] = (reason_df['Count'] / reason_df['Count'].sum() * 100).round(1)
+    
+    # Create bar chart
+    st.bar_chart(reason_df.set_index('Reason')['Count'])
+    
+    # Export options
+    st.markdown("---")
+    st.markdown("### 💾 Export Product Analysis")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # Detailed product report
+        if st.button("📊 Generate Detailed Product Report", use_container_width=True):
+            report_data = []
+            for sku, data in analysis_data['product_details'].items():
+                for reason, count in data['reason_breakdown'].items():
+                    report_data.append({
+                        'SKU': sku,
+                        'Total_Returns': data['total_returns'],
+                        'Quality_Score': data['quality_score'],
+                        'Risk_Level': data['risk_level'],
+                        'Return_Reason': reason,
+                        'Reason_Count': count,
+                        'Reason_Percentage': (count / data['total_returns'] * 100)
+                    })
+            
+            report_df = pd.DataFrame(report_data)
+            csv = report_df.to_csv(index=False)
+            
+            st.download_button(
+                label="Download Product Analysis CSV",
+                data=csv,
+                file_name=f"product_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv"
+            )
+    
+    with col2:
+        # Action plan export
+        if st.button("📋 Export Action Plan", use_container_width=True):
+            action_data = []
+            for sku, recs in recommendations.items():
+                product_data = analysis_data['product_details'][sku]
+                for rec in recs:
+                    action_data.append({
+                        'SKU': sku,
+                        'Total_Returns': product_data['total_returns'],
+                        'Quality_Score': product_data['quality_score'],
+                        'Priority': rec['priority'],
+                        'Action': rec['action'],
+                        'Details': rec['detail']
+                    })
+            
+            if action_data:
+                action_df = pd.DataFrame(action_data)
+                action_df = action_df.sort_values(['Priority', 'Total_Returns'], 
+                                                ascending=[True, False])
+                csv = action_df.to_csv(index=False)
+                
+                st.download_button(
+                    label="Download Action Plan CSV",
+                    data=csv,
+                    file_name=f"action_plan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv"
+                )
+            else:
+                st.info("No action items to export")
     
     # Header
     st.markdown("""
@@ -763,7 +1074,21 @@ def main():
                             - Extracted {successful} SKUs
                             """)
                             
+                            # Perform product analysis
+                            product_analysis = analyze_product_data(processed_dfs)
+                            
+                            if product_analysis:
+                                # Generate recommendations
+                                recommendations = generate_product_recommendations(
+                                    product_analysis['product_details']
+                                )
+                                
+                                # Display product analysis
+                                st.markdown("---")
+                                display_product_analysis(product_analysis, recommendations)
+                            
                             # Download section
+                            st.markdown("---")
                             st.markdown("### 💾 Download Processed File")
                             
                             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
