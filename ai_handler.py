@@ -1,7 +1,7 @@
 """
-ai_handler.py - Optimized AI Handler Module for B2B Report Analyzer
-Supports Claude and OpenAI with batch processing for faster extraction
-Includes caching and parallel processing capabilities
+ai_handler.py - Multi-Provider AI Handler Module for B2B Report Analyzer
+Supports Claude and OpenAI with automatic fallback and rate limit handling
+User can select preferred provider or use auto-failover
 """
 
 import os
@@ -13,17 +13,31 @@ from typing import Optional, Dict, Any, List, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import time
+import re
 
 logger = logging.getLogger(__name__)
 
 class AIHandler:
-    """Optimized AI handler with batch processing and caching"""
+    """Multi-provider AI handler with rate limit handling and fallback"""
     
-    def __init__(self):
+    def __init__(self, preferred_provider='auto'):
+        """
+        Initialize AI handler with provider preference
+        
+        Args:
+            preferred_provider: 'claude', 'openai', or 'auto' (tries both)
+        """
         self.claude_key = self._get_api_key('claude')
         self.openai_key = self._get_api_key('openai')
-        self.provider = self._determine_provider()
-        self.api_calls = 0
+        self.preferred_provider = preferred_provider
+        
+        # Track rate limits
+        self.claude_rate_limited_until = 0
+        self.openai_rate_limited_until = 0
+        
+        # API call tracking
+        self.api_calls = {'claude': 0, 'openai': 0, 'total': 0}
+        self.api_errors = {'claude': 0, 'openai': 0}
         self.last_error = None
         
         # Caching for repeated descriptions
@@ -37,6 +51,23 @@ class AIHandler:
         
         # Pattern compilation for faster regex
         self._compile_patterns()
+        
+        # Log available providers
+        self._log_provider_status()
+    
+    def _log_provider_status(self):
+        """Log which providers are available"""
+        providers = []
+        if self.claude_key:
+            providers.append("Claude")
+        if self.openai_key:
+            providers.append("OpenAI")
+        
+        if providers:
+            logger.info(f"AI Providers available: {', '.join(providers)}")
+            logger.info(f"Preferred provider: {self.preferred_provider}")
+        else:
+            logger.warning("No AI providers configured")
     
     def _compile_patterns(self):
         """Pre-compile regex patterns for faster matching"""
@@ -51,7 +82,7 @@ class AIHandler:
         ]
     
     def _get_api_key(self, provider: str) -> Optional[str]:
-        """Get API key from Streamlit secrets"""
+        """Get API key from Streamlit secrets or environment"""
         try:
             if provider == 'claude':
                 for key_name in ['ANTHROPIC_API_KEY', 'anthropic_api_key', 'claude_api_key']:
@@ -72,32 +103,89 @@ class AIHandler:
         
         return None
     
-    def _determine_provider(self) -> str:
-        """Determine which AI provider to use"""
-        if self.claude_key:
-            return 'claude'
-        elif self.openai_key:
-            return 'openai'
-        else:
-            return 'none'
+    def get_available_providers(self) -> List[str]:
+        """Get list of available providers"""
+        providers = []
+        if self.claude_key and not self._is_rate_limited('claude'):
+            providers.append('claude')
+        if self.openai_key and not self._is_rate_limited('openai'):
+            providers.append('openai')
+        return providers
+    
+    def _is_rate_limited(self, provider: str) -> bool:
+        """Check if provider is currently rate limited"""
+        current_time = time.time()
+        if provider == 'claude':
+            return current_time < self.claude_rate_limited_until
+        elif provider == 'openai':
+            return current_time < self.openai_rate_limited_until
+        return False
+    
+    def _set_rate_limit(self, provider: str, duration: int = 60):
+        """Set rate limit for provider"""
+        current_time = time.time()
+        if provider == 'claude':
+            self.claude_rate_limited_until = current_time + duration
+            logger.warning(f"Claude rate limited for {duration} seconds")
+        elif provider == 'openai':
+            self.openai_rate_limited_until = current_time + duration
+            logger.warning(f"OpenAI rate limited for {duration} seconds")
     
     def get_status(self) -> Dict[str, Any]:
-        """Get AI handler status with cache stats"""
+        """Get detailed AI handler status"""
+        available_providers = self.get_available_providers()
+        
+        # Determine active provider
+        if self.preferred_provider == 'auto':
+            active_provider = available_providers[0] if available_providers else 'none'
+        elif self.preferred_provider in available_providers:
+            active_provider = self.preferred_provider
+        else:
+            active_provider = available_providers[0] if available_providers else 'none'
+        
         return {
-            'available': self.provider != 'none',
-            'provider': self.provider,
+            'available': len(available_providers) > 0,
+            'providers': available_providers,
+            'active_provider': active_provider,
+            'preferred_provider': self.preferred_provider,
             'api_calls': self.api_calls,
+            'api_errors': self.api_errors,
             'cache_hits': self.cache_hits,
             'cache_size': len(self.sku_cache) + len(self.reason_cache),
-            'last_error': self.last_error
+            'last_error': self.last_error,
+            'rate_limits': {
+                'claude': self._is_rate_limited('claude'),
+                'openai': self._is_rate_limited('openai')
+            }
         }
     
     def _get_cache_key(self, text: str) -> str:
         """Generate cache key for text"""
         return hashlib.md5(text.lower().strip().encode()).hexdigest()
     
-    def extract_sku_fast(self, description: str) -> str:
-        """Fast SKU extraction using patterns first, then AI"""
+    def _select_provider(self) -> Optional[str]:
+        """Select best available provider based on preference and availability"""
+        available = self.get_available_providers()
+        
+        if not available:
+            return None
+        
+        if self.preferred_provider == 'auto':
+            # Auto mode: prefer OpenAI for speed, Claude for quality
+            if 'openai' in available:
+                return 'openai'
+            elif 'claude' in available:
+                return 'claude'
+        elif self.preferred_provider in available:
+            return self.preferred_provider
+        else:
+            # Fallback to any available
+            return available[0]
+        
+        return None
+    
+    def extract_sku(self, description: str) -> str:
+        """Extract SKU with intelligent provider selection"""
         if not description or pd.isna(description):
             return ""
         
@@ -109,7 +197,7 @@ class AIHandler:
             self.cache_hits += 1
             return self.sku_cache[cache_key]
         
-        # Try pattern matching first (faster)
+        # Try pattern matching first (fastest)
         for pattern in self.sku_patterns:
             match = pattern.search(description)
             if match:
@@ -117,41 +205,54 @@ class AIHandler:
                 self.sku_cache[cache_key] = sku
                 return sku
         
-        # Fall back to AI if no pattern match
-        if self.provider != 'none':
-            sku = self.extract_sku(description)
-            self.sku_cache[cache_key] = sku
-            return sku
-        
-        self.sku_cache[cache_key] = ""
-        return ""
-    
-    def extract_sku(self, description: str) -> str:
-        """Extract SKU from description using AI"""
-        if self.provider == 'none':
+        # Use AI with provider selection
+        provider = self._select_provider()
+        if not provider:
+            self.sku_cache[cache_key] = ""
             return ""
         
         prompt = f"""Extract the SKU (product code) from this support ticket description. 
 Common SKU patterns include: LVA1004-UPC, SUP1001, MOB2003, RHB3002, or similar alphanumeric codes.
 If no SKU is found, respond with "NOT_FOUND".
 
-Description: {description[:500]}  # Limit description length for speed
+Description: {description[:500]}
 
 SKU:"""
         
         try:
-            if self.provider == 'claude':
-                return self._call_claude(prompt, max_tokens=20)
-            elif self.provider == 'openai':
-                return self._call_openai(prompt, max_tokens=20)
+            if provider == 'claude':
+                result = self._call_claude(prompt, max_tokens=20)
+            else:  # openai
+                result = self._call_openai(prompt, max_tokens=20)
+            
+            if result and result != "NOT_FOUND":
+                self.sku_cache[cache_key] = result
+                return result
+                
         except Exception as e:
-            logger.error(f"AI SKU extraction error: {e}")
+            logger.error(f"AI SKU extraction error ({provider}): {e}")
             self.last_error = str(e)
+            
+            # Try fallback provider
+            fallback = 'openai' if provider == 'claude' else 'claude'
+            if fallback in self.get_available_providers():
+                try:
+                    if fallback == 'claude':
+                        result = self._call_claude(prompt, max_tokens=20)
+                    else:
+                        result = self._call_openai(prompt, max_tokens=20)
+                    
+                    if result and result != "NOT_FOUND":
+                        self.sku_cache[cache_key] = result
+                        return result
+                except:
+                    pass
         
+        self.sku_cache[cache_key] = ""
         return ""
     
-    def extract_reason_fast(self, description: str) -> str:
-        """Fast reason extraction with caching"""
+    def extract_reason(self, description: str) -> str:
+        """Extract reason with intelligent provider selection"""
         if not description or pd.isna(description):
             return "Other"
         
@@ -166,12 +267,12 @@ SKU:"""
         # Quick keyword check first
         description_lower = description.lower()
         quick_matches = {
-            'defective': ['defect', 'broken', 'not working', 'malfunction'],
-            'wrong item': ['wrong', 'incorrect', 'not what ordered'],
-            'not needed': ['no longer need', "don't need", 'changed mind'],
-            'quality issue': ['poor quality', 'cheap', 'flimsy'],
-            'size issue': ['too small', 'too large', 'wrong size'],
-            'missing parts': ['missing', 'incomplete', 'not all parts'],
+            'Defective': ['defect', 'broken', 'not working', 'malfunction'],
+            'Wrong Item': ['wrong', 'incorrect', 'not what ordered'],
+            'Not Needed': ['no longer need', "don't need", 'changed mind'],
+            'Quality Issue': ['poor quality', 'cheap', 'flimsy'],
+            'Size Issue': ['too small', 'too large', 'wrong size'],
+            'Missing Parts': ['missing', 'incomplete', 'not all parts'],
         }
         
         for reason, keywords in quick_matches.items():
@@ -179,18 +280,10 @@ SKU:"""
                 self.reason_cache[cache_key] = reason
                 return reason
         
-        # Use AI for ambiguous cases
-        if self.provider != 'none':
-            reason = self.extract_reason(description)
-            self.reason_cache[cache_key] = reason
-            return reason
-        
-        self.reason_cache[cache_key] = "Other"
-        return "Other"
-    
-    def extract_reason(self, description: str) -> str:
-        """Extract return/refund reason from description using AI"""
-        if self.provider == 'none':
+        # Use AI with provider selection
+        provider = self._select_provider()
+        if not provider:
+            self.reason_cache[cache_key] = "Other"
             return "Other"
         
         prompt = f"""Extract and categorize the return/refund reason from this support ticket description.
@@ -204,114 +297,45 @@ Provide a brief, clear reason (2-5 words). Common categories include:
 - Damaged in Shipping
 - Other
 
-Description: {description[:500]}  # Limit for speed
+Description: {description[:500]}
 
 Reason:"""
         
         try:
-            if self.provider == 'claude':
-                return self._call_claude(prompt, max_tokens=30)
-            elif self.provider == 'openai':
-                return self._call_openai(prompt, max_tokens=30)
+            if provider == 'claude':
+                result = self._call_claude(prompt, max_tokens=30)
+            else:  # openai
+                result = self._call_openai(prompt, max_tokens=30)
+            
+            if result:
+                self.reason_cache[cache_key] = result
+                return result
+                
         except Exception as e:
-            logger.error(f"AI reason extraction error: {e}")
+            logger.error(f"AI reason extraction error ({provider}): {e}")
             self.last_error = str(e)
+            
+            # Try fallback provider
+            fallback = 'openai' if provider == 'claude' else 'claude'
+            if fallback in self.get_available_providers():
+                try:
+                    if fallback == 'claude':
+                        result = self._call_claude(prompt, max_tokens=30)
+                    else:
+                        result = self._call_openai(prompt, max_tokens=30)
+                    
+                    if result:
+                        self.reason_cache[cache_key] = result
+                        return result
+                except:
+                    pass
         
+        self.reason_cache[cache_key] = "Other"
         return "Other"
     
-    def batch_extract_parallel(self, descriptions: List[Tuple[int, str]], extract_type: str = 'both') -> Dict[int, Dict[str, str]]:
-        """Extract SKUs and/or Reasons from multiple descriptions in parallel"""
-        results = {}
-        
-        # Use ThreadPoolExecutor for parallel processing
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            # Submit all tasks
-            futures = {}
-            
-            for idx, desc in descriptions:
-                if extract_type == 'sku':
-                    future = executor.submit(self.extract_sku_fast, desc)
-                    futures[future] = (idx, 'sku')
-                elif extract_type == 'reason':
-                    future = executor.submit(self.extract_reason_fast, desc)
-                    futures[future] = (idx, 'reason')
-                else:  # both
-                    future_sku = executor.submit(self.extract_sku_fast, desc)
-                    future_reason = executor.submit(self.extract_reason_fast, desc)
-                    futures[future_sku] = (idx, 'sku')
-                    futures[future_reason] = (idx, 'reason')
-            
-            # Collect results
-            for future in as_completed(futures):
-                idx, field_type = futures[future]
-                try:
-                    result = future.result(timeout=5)
-                    if idx not in results:
-                        results[idx] = {}
-                    results[idx][field_type] = result
-                except Exception as e:
-                    logger.error(f"Batch extraction error for {idx}: {e}")
-                    if idx not in results:
-                        results[idx] = {}
-                    results[idx][field_type] = "" if field_type == 'sku' else "Other"
-        
-        return results
-    
-    def batch_extract_ai(self, items: List[Dict[str, Any]], batch_size: int = 5) -> List[Dict[str, Any]]:
-        """Batch process multiple items with AI for efficiency"""
-        if self.provider == 'none':
-            return items
-        
-        # Process in smaller batches to avoid token limits
-        for i in range(0, len(items), batch_size):
-            batch = items[i:i + batch_size]
-            
-            # Create combined prompt for batch
-            batch_prompt = self._create_batch_prompt(batch)
-            
-            try:
-                if self.provider == 'claude':
-                    response = self._call_claude(batch_prompt, max_tokens=200)
-                elif self.provider == 'openai':
-                    response = self._call_openai(batch_prompt, max_tokens=200)
-                
-                # Parse batch response
-                self._parse_batch_response(batch, response)
-                
-            except Exception as e:
-                logger.error(f"Batch AI processing error: {e}")
-        
-        return items
-    
-    def _create_batch_prompt(self, batch: List[Dict[str, Any]]) -> str:
-        """Create a combined prompt for batch processing"""
-        prompt = """Extract SKU and Reason for each item below. Format each response as:
-Item X: SKU: [sku_code], Reason: [brief_reason]
-
-"""
-        for i, item in enumerate(batch):
-            prompt += f"Item {i+1}: {item.get('description', '')[:200]}\n\n"
-        
-        return prompt
-    
-    def _parse_batch_response(self, batch: List[Dict[str, Any]], response: str):
-        """Parse AI response for batch items"""
-        lines = response.strip().split('\n')
-        
-        for i, line in enumerate(lines):
-            if i < len(batch) and 'Item' in line:
-                # Extract SKU and Reason from line
-                sku_match = re.search(r'SKU:\s*([A-Z0-9\-]+)', line, re.IGNORECASE)
-                reason_match = re.search(r'Reason:\s*([^,]+)', line, re.IGNORECASE)
-                
-                if sku_match:
-                    batch[i]['sku'] = sku_match.group(1).strip()
-                if reason_match:
-                    batch[i]['reason'] = reason_match.group(1).strip()
-    
     def _call_claude(self, prompt: str, max_tokens: int = 50) -> str:
-        """Call Claude API with retry logic"""
-        if not self.claude_key:
+        """Call Claude API with rate limit handling"""
+        if not self.claude_key or self._is_rate_limited('claude'):
             return ""
         
         headers = {
@@ -327,38 +351,52 @@ Item X: SKU: [sku_code], Reason: [brief_reason]
             "messages": [{"role": "user", "content": prompt}]
         }
         
-        for attempt in range(2):  # Retry once
+        for attempt in range(2):
             try:
                 response = requests.post(
                     "https://api.anthropic.com/v1/messages",
                     headers=headers,
                     json=data,
-                    timeout=5  # Shorter timeout for speed
+                    timeout=5
                 )
                 
                 if response.status_code == 200:
-                    self.api_calls += 1
+                    self.api_calls['claude'] += 1
+                    self.api_calls['total'] += 1
                     result = response.json()
                     return result['content'][0]['text'].strip()
-                elif response.status_code == 429:  # Rate limited
-                    time.sleep(1)  # Brief pause before retry
-                    continue
+                    
+                elif response.status_code == 429:
+                    # Rate limited
+                    self.api_errors['claude'] += 1
+                    retry_after = int(response.headers.get('retry-after', 60))
+                    self._set_rate_limit('claude', retry_after)
+                    logger.warning(f"Claude rate limited. Retry after {retry_after}s")
+                    break
+                    
                 else:
-                    logger.error(f"Claude API error: {response.status_code}")
+                    self.api_errors['claude'] += 1
+                    logger.error(f"Claude API error {response.status_code}: {response.text}")
                     break
                     
             except requests.Timeout:
-                logger.warning("Claude API timeout, retrying...")
-                continue
+                if attempt < 1:
+                    logger.warning("Claude API timeout, retrying...")
+                    continue
+                else:
+                    self.api_errors['claude'] += 1
+                    break
+                    
             except Exception as e:
+                self.api_errors['claude'] += 1
                 logger.error(f"Claude API call failed: {e}")
                 break
         
         return ""
     
     def _call_openai(self, prompt: str, max_tokens: int = 50) -> str:
-        """Call OpenAI API with retry logic"""
-        if not self.openai_key:
+        """Call OpenAI API with rate limit handling"""
+        if not self.openai_key or self._is_rate_limited('openai'):
             return ""
         
         headers = {
@@ -376,34 +414,54 @@ Item X: SKU: [sku_code], Reason: [brief_reason]
             "max_tokens": max_tokens
         }
         
-        for attempt in range(2):  # Retry once
+        for attempt in range(2):
             try:
                 response = requests.post(
                     "https://api.openai.com/v1/chat/completions",
                     headers=headers,
                     json=data,
-                    timeout=5  # Shorter timeout
+                    timeout=5
                 )
                 
                 if response.status_code == 200:
-                    self.api_calls += 1
+                    self.api_calls['openai'] += 1
+                    self.api_calls['total'] += 1
                     result = response.json()
                     return result['choices'][0]['message']['content'].strip()
-                elif response.status_code == 429:  # Rate limited
-                    time.sleep(1)
-                    continue
+                    
+                elif response.status_code == 429:
+                    # Rate limited
+                    self.api_errors['openai'] += 1
+                    retry_after = int(response.headers.get('retry-after', 60))
+                    self._set_rate_limit('openai', retry_after)
+                    logger.warning(f"OpenAI rate limited. Retry after {retry_after}s")
+                    break
+                    
                 else:
-                    logger.error(f"OpenAI API error: {response.status_code}")
+                    self.api_errors['openai'] += 1
+                    logger.error(f"OpenAI API error {response.status_code}: {response.text}")
                     break
                     
             except requests.Timeout:
-                logger.warning("OpenAI API timeout, retrying...")
-                continue
+                if attempt < 1:
+                    logger.warning("OpenAI API timeout, retrying...")
+                    continue
+                else:
+                    self.api_errors['openai'] += 1
+                    break
+                    
             except Exception as e:
+                self.api_errors['openai'] += 1
                 logger.error(f"OpenAI API call failed: {e}")
                 break
         
         return ""
+    
+    def set_preferred_provider(self, provider: str):
+        """Update preferred provider"""
+        if provider in ['claude', 'openai', 'auto']:
+            self.preferred_provider = provider
+            logger.info(f"AI provider preference set to: {provider}")
     
     def clear_cache(self):
         """Clear the cache to free memory"""
@@ -411,9 +469,26 @@ Item X: SKU: [sku_code], Reason: [brief_reason]
         self.reason_cache.clear()
         self.cache_hits = 0
         logger.info("AI cache cleared")
-
-# Add missing import at the top
-import re
+    
+    def get_provider_stats(self) -> Dict[str, Any]:
+        """Get detailed statistics for each provider"""
+        stats = {}
+        
+        for provider in ['claude', 'openai']:
+            success_rate = 0
+            if self.api_calls.get(provider, 0) > 0:
+                success_rate = ((self.api_calls[provider] - self.api_errors.get(provider, 0)) / 
+                               self.api_calls[provider] * 100)
+            
+            stats[provider] = {
+                'calls': self.api_calls.get(provider, 0),
+                'errors': self.api_errors.get(provider, 0),
+                'success_rate': success_rate,
+                'rate_limited': self._is_rate_limited(provider),
+                'available': (self.claude_key if provider == 'claude' else self.openai_key) is not None
+            }
+        
+        return stats
 
 # Example patterns for reference
 SKU_PATTERNS = [
