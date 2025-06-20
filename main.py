@@ -370,7 +370,7 @@ def process_single_row(row_data, ai_handler):
     return result
 
 def process_sheet_optimized(df, sheet_name, report_type, ai_handler):
-    """Process a single sheet with optimized extraction"""
+    """Process a single sheet with optimized extraction and confidence tracking"""
     # Get column names
     col_display = df.columns[0] if len(df.columns) > 0 else 'Display Name'
     col_description = df.columns[1] if len(df.columns) > 1 else 'Description'
@@ -389,6 +389,13 @@ def process_sheet_optimized(df, sheet_name, report_type, ai_handler):
     processed_df = df.copy()
     rows_processed = 0
     successful_extractions = 0
+    high_confidence_extractions = 0
+    
+    # Add confidence tracking columns if they don't exist
+    if 'SKU_Confidence' not in processed_df.columns:
+        processed_df['SKU_Confidence'] = 1.0  # Default to 1.0 for existing data
+    if 'Reason_Confidence' not in processed_df.columns:
+        processed_df['Reason_Confidence'] = 1.0
     
     # Process in batches for better performance
     batch_size = 10
@@ -407,7 +414,7 @@ def process_sheet_optimized(df, sheet_name, report_type, ai_handler):
     for i in range(0, len(row_data_list), batch_size):
         batch = row_data_list[i:i+batch_size]
         
-        # Process batch (could be parallelized if AI handler supports it)
+        # Process batch
         for row_data in batch:
             result = process_single_row(row_data, ai_handler)
             
@@ -415,15 +422,27 @@ def process_sheet_optimized(df, sheet_name, report_type, ai_handler):
                 idx = result['index']
                 processed_df.at[idx, col_sku] = result['sku']
                 processed_df.at[idx, col_reason] = result['reason']
+                processed_df.at[idx, 'SKU_Confidence'] = result.get('sku_confidence', 0.8)
+                processed_df.at[idx, 'Reason_Confidence'] = result.get('reason_confidence', 0.8)
+                
                 rows_processed += 1
                 
-                if result['sku'] and result['sku'] != "":
+                # Count high-confidence successful extractions
+                if result['sku'] and result['sku'] != "" and result.get('sku_confidence', 0) >= 0.8:
                     successful_extractions += 1
+                    if result.get('sku_confidence', 0) >= 0.9:
+                        high_confidence_extractions += 1
     
     # Add metadata
     processed_df['Processed_Date'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     processed_df['Report_Type'] = report_type
     processed_df['Sheet_Name'] = sheet_name
+    
+    # If AI handler has the method, add known SKUs for future validation
+    if hasattr(ai_handler, 'add_known_sku'):
+        valid_skus = processed_df[processed_df[col_sku].notna() & (processed_df[col_sku] != '')][col_sku].unique()
+        for sku in valid_skus:
+            ai_handler.add_known_sku(sku)
     
     return processed_df, rows_processed, successful_extractions
 
@@ -504,7 +523,17 @@ def process_excel_file_optimized(file, report_type, sheets_to_process):
     
     return all_processed_dfs, total_rows_processed, total_successful
 
-def analyze_product_data(all_processed_dfs):
+def main():
+    """Main application function"""
+    initialize_session_state()
+    
+    # Header
+    st.markdown("""
+    <div class="main-header">
+        <h1 class="main-title">B2B Report Analyzer</h1>
+        <p class="subtitle">Automated SKU and Reason Extraction from Odoo Support Tickets</p>
+    </div>
+    """, unsafe_allow_html=True)
     """Perform comprehensive product analysis on processed data"""
     # Combine all data
     combined_df = pd.concat(all_processed_dfs, ignore_index=True)
