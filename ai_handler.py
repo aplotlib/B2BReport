@@ -1,6 +1,7 @@
 """
-AI Handler Module for B2B Report Analyzer
+ai_handler.py - AI Handler Module for B2B Report Analyzer
 Supports Claude and OpenAI for SKU and Reason extraction
+This file must be in the same directory as app.py
 """
 
 import os
