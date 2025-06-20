@@ -1,6 +1,7 @@
 """
-B2B Report Analyzer
+app.py - B2B Report Analyzer
 Automated SKU and Reason extraction from Odoo support tickets
+Processes multiple sheets and fills only empty cells in columns C & D
 For Vive Health Quality Management
 """
 
@@ -153,12 +154,20 @@ def initialize_session_state():
         st.session_state.processed_data = None
     if 'original_data' not in st.session_state:
         st.session_state.original_data = None
+    if 'original_file' not in st.session_state:
+        st.session_state.original_file = None
     if 'ai_handler' not in st.session_state:
         st.session_state.ai_handler = None
     if 'processing_complete' not in st.session_state:
         st.session_state.processing_complete = False
     if 'report_type' not in st.session_state:
         st.session_state.report_type = 'Return'
+    if 'total_rows' not in st.session_state:
+        st.session_state.total_rows = 0
+    if 'skus_extracted' not in st.session_state:
+        st.session_state.skus_extracted = 0
+    if 'success_rate' not in st.session_state:
+        st.session_state.success_rate = 0.0
 
 def extract_sku_from_description(description, ai_handler=None):
     """Extract SKU from description using AI or patterns"""
@@ -228,16 +237,83 @@ def extract_reason_from_description(description, ai_handler=None):
     
     return "Other"
 
-def process_excel_file(df, report_type):
-    """Process the Excel file to extract SKU and Reason"""
-    # Validate required columns
-    required_columns = ['Display Name', 'Description', 'SKU', 'Reason']
-    missing_columns = [col for col in required_columns if col not in df.columns]
+def validate_sheet_columns(df, sheet_name):
+    """Validate if sheet has proper columns C and D as SKU and Reason"""
+    # Check if we have at least 4 columns (A, B, C, D)
+    if len(df.columns) < 4:
+        logger.warning(f"Sheet '{sheet_name}' has less than 4 columns")
+        return False
     
-    if missing_columns:
-        st.error(f"Missing required columns: {', '.join(missing_columns)}")
-        return None
+    # Get column C (index 2) and column D (index 3)
+    col_c = df.columns[2] if len(df.columns) > 2 else None
+    col_d = df.columns[3] if len(df.columns) > 3 else None
     
+    # Check if columns are named SKU and Reason (case-insensitive)
+    has_sku = col_c and 'sku' in str(col_c).lower()
+    has_reason = col_d and 'reason' in str(col_d).lower()
+    
+    if not has_sku or not has_reason:
+        logger.info(f"Sheet '{sheet_name}' - Column C: {col_c}, Column D: {col_d}")
+        if not has_sku and col_c:
+            st.warning(f"⚠️ Sheet '{sheet_name}': Column C is '{col_c}' but should be 'SKU'")
+        if not has_reason and col_d:
+            st.warning(f"⚠️ Sheet '{sheet_name}': Column D is '{col_d}' but should be 'Reason'")
+        return False
+    
+    return True
+
+def process_single_sheet(df, sheet_name, report_type, ai_handler):
+    """Process a single sheet to extract SKU and Reason"""
+    # Validate columns
+    if not validate_sheet_columns(df, sheet_name):
+        return None, 0, 0
+    
+    # Get actual column names
+    col_display = df.columns[0] if len(df.columns) > 0 else 'Display Name'
+    col_description = df.columns[1] if len(df.columns) > 1 else 'Description'
+    col_sku = df.columns[2] if len(df.columns) > 2 else 'SKU'
+    col_reason = df.columns[3] if len(df.columns) > 3 else 'Reason'
+    
+    # Process only rows with empty SKU or Reason
+    processed_df = df.copy()
+    rows_processed = 0
+    successful_extractions = 0
+    
+    for idx, row in df.iterrows():
+        # Check if SKU or Reason is empty
+        sku_empty = pd.isna(row[col_sku]) or str(row[col_sku]).strip() == ''
+        reason_empty = pd.isna(row[col_reason]) or str(row[col_reason]).strip() == ''
+        
+        # Skip if both are already filled
+        if not sku_empty and not reason_empty:
+            continue
+        
+        rows_processed += 1
+        
+        # Get description
+        description = row[col_description] if col_description in df.columns else ''
+        
+        # Extract SKU if empty
+        if sku_empty:
+            sku = extract_sku_from_description(description, ai_handler)
+            processed_df.at[idx, col_sku] = sku
+            if sku and sku != "":
+                successful_extractions += 1
+        
+        # Extract Reason if empty
+        if reason_empty:
+            reason = extract_reason_from_description(description, ai_handler)
+            processed_df.at[idx, col_reason] = reason
+    
+    # Add metadata
+    processed_df['Processed_Date'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    processed_df['Report_Type'] = report_type
+    processed_df['Sheet_Name'] = sheet_name
+    
+    return processed_df, rows_processed, successful_extractions
+
+def process_excel_file_all_sheets(file, report_type):
+    """Process all sheets in the Excel file"""
     # Initialize AI handler if available
     ai_handler = None
     if AI_AVAILABLE and st.session_state.ai_handler is None:
@@ -258,40 +334,98 @@ def process_excel_file(df, report_type):
     else:
         ai_handler = st.session_state.ai_handler
     
-    # Process each row
-    total_rows = len(df)
-    progress_bar = st.progress(0)
-    status_text = st.empty()
+    # Read all sheets
+    excel_file = pd.ExcelFile(file)
+    sheet_names = excel_file.sheet_names
     
-    processed_df = df.copy()
-    successful_extractions = 0
+    st.info(f"📊 Found {len(sheet_names)} sheet(s) in the Excel file")
     
-    for idx, row in df.iterrows():
-        # Update progress
-        progress = (idx + 1) / total_rows
-        progress_bar.progress(progress)
-        status_text.text(f"Processing row {idx + 1} of {total_rows}...")
+    # Process each sheet
+    all_processed_dfs = []
+    total_rows_processed = 0
+    total_successful = 0
+    sheet_summary = []
+    
+    # Create a progress container
+    progress_container = st.container()
+    
+    with progress_container:
+        overall_progress = st.progress(0)
+        status_text = st.empty()
+        sheet_details = st.empty()
+    
+    for idx, sheet_name in enumerate(sheet_names):
+        # Update overall progress
+        overall_progress.progress((idx) / len(sheet_names))
+        status_text.text(f"Processing sheet {idx + 1} of {len(sheet_names)}: {sheet_name}")
         
-        # Extract SKU
-        if pd.isna(row['SKU']) or str(row['SKU']).strip() == '':
-            sku = extract_sku_from_description(row['Description'], ai_handler)
-            processed_df.at[idx, 'SKU'] = sku
-            if sku:
-                successful_extractions += 1
+        # Read sheet
+        df = pd.read_excel(excel_file, sheet_name=sheet_name)
         
-        # Extract Reason
-        if pd.isna(row['Reason']) or str(row['Reason']).strip() == '':
-            reason = extract_reason_from_description(row['Description'], ai_handler)
-            processed_df.at[idx, 'Reason'] = reason
+        # Show sheet details
+        sheet_details.info(f"Sheet '{sheet_name}': {len(df)} rows")
+        
+        # Process sheet
+        processed_df, rows_processed, successful = process_single_sheet(
+            df, sheet_name, report_type, ai_handler
+        )
+        
+        if processed_df is not None and rows_processed > 0:
+            all_processed_dfs.append(processed_df)
+            total_rows_processed += rows_processed
+            total_successful += successful
+            
+            sheet_summary.append({
+                'Sheet': sheet_name,
+                'Total Rows': len(df),
+                'Rows Processed': rows_processed,
+                'Successful Extractions': successful
+            })
+        elif processed_df is not None:
+            # Sheet had no empty cells to process
+            sheet_summary.append({
+                'Sheet': sheet_name,
+                'Total Rows': len(df),
+                'Rows Processed': 0,
+                'Successful Extractions': 0,
+                'Note': 'All SKU and Reason cells already filled'
+            })
+        else:
+            # Sheet validation failed
+            sheet_summary.append({
+                'Sheet': sheet_name,
+                'Total Rows': len(df),
+                'Rows Processed': 0,
+                'Successful Extractions': 0,
+                'Note': 'Invalid column structure (SKU/Reason not in columns C/D)'
+            })
     
-    progress_bar.empty()
-    status_text.empty()
+    # Final progress update
+    overall_progress.progress(1.0)
+    status_text.text("Processing complete!")
+    sheet_details.empty()
     
-    # Add metadata
-    processed_df['Processed_Date'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    processed_df['Report_Type'] = report_type
+    # Clear progress container
+    progress_container.empty()
     
-    return processed_df, successful_extractions
+    # Show summary
+    if sheet_summary:
+        st.markdown("### 📊 Processing Summary by Sheet")
+        summary_df = pd.DataFrame(sheet_summary)
+        st.dataframe(summary_df)
+    
+    # Check if any sheets were successfully processed
+    if not all_processed_dfs:
+        st.error("""
+        ❌ No sheets could be processed. Please ensure:
+        - Column C is titled "SKU"
+        - Column D is titled "Reason"
+        - There are empty cells in columns C or D to fill
+        
+        Current column positions matter - SKU must be in column C and Reason in column D.
+        """)
+    
+    return all_processed_dfs, total_rows_processed, total_successful
 
 def main():
     initialize_session_state()
@@ -326,22 +460,28 @@ def main():
             3. Select all tickets
             4. Export to Excel
             
-            **Step 2: Upload File**
-            - File must have columns:
-              - Display Name
-              - Description
-              - SKU (empty)
-              - Reason (empty)
+            **Step 2: File Requirements**
+            - Excel file with one or more sheets
+            - **Column C**: Must be titled "SKU"
+            - **Column D**: Must be titled "Reason"
+            - **Column B**: Should contain Description
+            - Tool processes ALL sheets automatically
+            - Only updates empty cells in columns C & D
             
             **Step 3: Process**
-            - AI will extract SKU and Reason from Description
-            - Download the processed file
+            - AI extracts SKU and Reason from Description
+            - Existing data in columns C & D is preserved
+            - Each sheet is processed independently
+            - Download the fully processed file
             
             **Expected SKU Formats:**
             - LVA1004-UPC
             - SUP1001
             - MOB2003
             - RHB3002
+            
+            **Note:** The tool ONLY processes rows where 
+            Column C (SKU) or Column D (Reason) is empty.
             """)
         
         st.markdown("---")
@@ -362,9 +502,11 @@ def main():
         if st.session_state.processing_complete:
             st.markdown("---")
             st.markdown("### 📊 Processing Stats")
-            st.metric("Total Rows", st.session_state.total_rows)
+            st.metric("Total Rows Processed", st.session_state.total_rows)
             st.metric("SKUs Extracted", st.session_state.skus_extracted)
             st.metric("Success Rate", f"{st.session_state.success_rate:.1f}%")
+            if isinstance(st.session_state.processed_data, list):
+                st.metric("Sheets Processed", len(st.session_state.processed_data))
     
     # Main content
     col1, col2 = st.columns([2, 1])
@@ -373,8 +515,12 @@ def main():
         st.markdown("### 📤 Upload Odoo Export")
         st.markdown("""
         <div class="info-box">
-        Upload your Excel file exported from Odoo Support Tickets. 
-        The file should contain tickets filtered by "return" with empty SKU and Reason columns.
+        <strong>File Requirements:</strong><br>
+        • Excel file from Odoo with multiple sheets<br>
+        • Column C must be titled "SKU"<br>
+        • Column D must be titled "Reason"<br>
+        • Tool will scan ALL sheets and process only empty cells<br>
+        • Existing data in columns C & D will be preserved
         </div>
         """, unsafe_allow_html=True)
     
@@ -397,37 +543,97 @@ def main():
     if uploaded_file:
         # Read file
         try:
-            df = pd.read_excel(uploaded_file)
-            st.session_state.original_data = df
+            # Store the file in session state for processing
+            st.session_state.original_file = uploaded_file
+            
+            # Get basic file info
+            excel_file = pd.ExcelFile(uploaded_file)
+            sheet_names = excel_file.sheet_names
             
             # Display file info
             st.success(f"✅ File loaded: {uploaded_file.name}")
             
             col1, col2, col3 = st.columns(3)
             with col1:
-                st.metric("Total Rows", len(df))
+                st.metric("Total Sheets", len(sheet_names))
             with col2:
-                empty_skus = df['SKU'].isna().sum() if 'SKU' in df.columns else 0
-                st.metric("Empty SKUs", empty_skus)
+                total_rows = sum(len(pd.read_excel(excel_file, sheet_name=sheet)) for sheet in sheet_names)
+                st.metric("Total Rows", total_rows)
             with col3:
-                empty_reasons = df['Reason'].isna().sum() if 'Reason' in df.columns else 0
-                st.metric("Empty Reasons", empty_reasons)
+                # Check for empty cells in columns C and D across all sheets
+                empty_cells = 0
+                for sheet in sheet_names:
+                    df = pd.read_excel(excel_file, sheet_name=sheet)
+                    if len(df.columns) >= 4:
+                        col_c = df.columns[2]
+                        col_d = df.columns[3]
+                        empty_cells += df[col_c].isna().sum() + df[col_d].isna().sum()
+                st.metric("Empty Cells (C&D)", empty_cells)
             
-            # Preview data
-            with st.expander("📋 Preview Data", expanded=True):
-                st.dataframe(df.head(10))
+            # Show sheets info
+            with st.expander("📑 Sheet Information", expanded=True):
+                sheet_info = []
+                for sheet_name in sheet_names:
+                    df = pd.read_excel(excel_file, sheet_name=sheet_name)
+                    
+                    # Check columns C and D
+                    if len(df.columns) >= 4:
+                        col_c = df.columns[2]
+                        col_d = df.columns[3]
+                        col_c_empty = df[col_c].isna().sum()
+                        col_d_empty = df[col_d].isna().sum()
+                        
+                        sheet_info.append({
+                            'Sheet Name': sheet_name,
+                            'Rows': len(df),
+                            'Column C': col_c,
+                            'Column D': col_d,
+                            'Empty in C': col_c_empty,
+                            'Empty in D': col_d_empty,
+                            'Ready to Process': 'Yes' if (col_c_empty > 0 or col_d_empty > 0) else 'No'
+                        })
+                    else:
+                        sheet_info.append({
+                            'Sheet Name': sheet_name,
+                            'Rows': len(df),
+                            'Column C': 'N/A',
+                            'Column D': 'N/A',
+                            'Empty in C': 0,
+                            'Empty in D': 0,
+                            'Ready to Process': 'No - Insufficient columns'
+                        })
+                
+                sheet_df = pd.DataFrame(sheet_info)
+                st.dataframe(sheet_df)
+                
+                # Show preview of first sheet with data
+                for sheet_name in sheet_names:
+                    df = pd.read_excel(excel_file, sheet_name=sheet_name)
+                    if len(df) > 0:
+                        st.markdown(f"#### Preview: {sheet_name}")
+                        # Show first 5 rows, focusing on columns A-D
+                        preview_cols = df.columns[:4] if len(df.columns) >= 4 else df.columns
+                        st.dataframe(df[preview_cols].head(5))
+                        break
             
             # Process button
-            if st.button("🚀 Process File", type="primary", use_container_width=True):
-                with st.spinner("Processing file..."):
-                    processed_df, successful = process_excel_file(df, st.session_state.report_type)
+            if st.button("🚀 Process All Sheets", type="primary", use_container_width=True):
+                with st.spinner("Processing all sheets..."):
+                    # Reset the file pointer
+                    uploaded_file.seek(0)
                     
-                    if processed_df is not None:
-                        st.session_state.processed_data = processed_df
+                    # Process all sheets
+                    processed_dfs, rows_processed, successful = process_excel_file_all_sheets(
+                        uploaded_file, 
+                        st.session_state.report_type
+                    )
+                    
+                    if processed_dfs:
+                        st.session_state.processed_data = processed_dfs
                         st.session_state.processing_complete = True
-                        st.session_state.total_rows = len(processed_df)
+                        st.session_state.total_rows = rows_processed
                         st.session_state.skus_extracted = successful
-                        st.session_state.success_rate = (successful / len(processed_df) * 100) if len(processed_df) > 0 else 0
+                        st.session_state.success_rate = (successful / rows_processed * 100) if rows_processed > 0 else 0
                         
                         st.balloons()
                         st.success("✅ Processing complete!")
@@ -437,30 +643,42 @@ def main():
                         
                         col1, col2 = st.columns(2)
                         with col1:
-                            st.markdown("""
+                            st.markdown(f"""
                             <div class="success-box">
                             <h4>✅ Successfully Processed</h4>
+                            <p>Processed {len(processed_dfs)} sheet(s) with {rows_processed} rows needing extraction.</p>
                             <p>SKUs and Reasons have been extracted from the Description column.</p>
                             </div>
                             """, unsafe_allow_html=True)
                         
                         with col2:
                             # Summary metrics
-                            unique_skus = processed_df['SKU'].nunique()
-                            unique_reasons = processed_df['Reason'].nunique()
+                            unique_skus = set()
+                            unique_reasons = set()
                             
-                            st.metric("Unique SKUs", unique_skus)
-                            st.metric("Unique Reasons", unique_reasons)
+                            for df in processed_dfs:
+                                col_sku = df.columns[2] if len(df.columns) > 2 else 'SKU'
+                                col_reason = df.columns[3] if len(df.columns) > 3 else 'Reason'
+                                
+                                if col_sku in df.columns:
+                                    unique_skus.update(df[col_sku].dropna().unique())
+                                if col_reason in df.columns:
+                                    unique_reasons.update(df[col_reason].dropna().unique())
+                            
+                            st.metric("Unique SKUs", len(unique_skus))
+                            st.metric("Unique Reasons", len(unique_reasons))
                         
-                        # Preview processed data
-                        st.markdown("### 📋 Processed Data Preview")
-                        display_cols = ['Display Name', 'SKU', 'Reason', 'Description']
-                        st.dataframe(processed_df[display_cols].head(20))
+                        # Reason distribution across all sheets
+                        all_reasons = []
+                        for df in processed_dfs:
+                            col_reason = df.columns[3] if len(df.columns) > 3 else 'Reason'
+                            if col_reason in df.columns:
+                                all_reasons.extend(df[col_reason].dropna().tolist())
                         
-                        # Reason distribution
-                        if 'Reason' in processed_df.columns:
-                            st.markdown("### 📈 Reason Distribution")
-                            reason_counts = processed_df['Reason'].value_counts()
+                        if all_reasons:
+                            st.markdown("### 📈 Reason Distribution (All Sheets)")
+                            reason_series = pd.Series(all_reasons)
+                            reason_counts = reason_series.value_counts()
                             st.bar_chart(reason_counts)
                         
                         # Download section
@@ -473,29 +691,49 @@ def main():
                         # Create download button
                         output = io.BytesIO()
                         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                            processed_df.to_excel(writer, index=False, sheet_name='Processed_Data')
-                            
-                            # Add formatting
                             workbook = writer.book
-                            worksheet = writer.sheets['Processed_Data']
                             
-                            # Header format
-                            header_format = workbook.add_format({
-                                'bold': True,
-                                'bg_color': '#1e88e5',
-                                'font_color': 'white',
-                                'border': 1
-                            })
-                            
-                            # Write headers with format
-                            for col_num, value in enumerate(processed_df.columns.values):
-                                worksheet.write(0, col_num, value, header_format)
-                            
-                            # Adjust column widths
-                            worksheet.set_column('A:A', 30)  # Display Name
-                            worksheet.set_column('B:B', 100)  # Description
-                            worksheet.set_column('C:C', 20)  # SKU
-                            worksheet.set_column('D:D', 25)  # Reason
+                            # Write each processed sheet
+                            for idx, df in enumerate(processed_dfs):
+                                sheet_name = df['Sheet_Name'].iloc[0] if 'Sheet_Name' in df.columns else f'Sheet_{idx+1}'
+                                
+                                # Remove the Sheet_Name column before writing
+                                df_to_write = df.drop(columns=['Sheet_Name']) if 'Sheet_Name' in df.columns else df
+                                
+                                df_to_write.to_excel(writer, index=False, sheet_name=sheet_name)
+                                
+                                # Add formatting
+                                worksheet = writer.sheets[sheet_name]
+                                
+                                # Header format
+                                header_format = workbook.add_format({
+                                    'bold': True,
+                                    'bg_color': '#1e88e5',
+                                    'font_color': 'white',
+                                    'border': 1
+                                })
+                                
+                                # Write headers with format
+                                for col_num, value in enumerate(df_to_write.columns.values):
+                                    worksheet.write(0, col_num, value, header_format)
+                                
+                                # Highlight columns C and D (SKU and Reason)
+                                highlight_format = workbook.add_format({
+                                    'bg_color': '#E8F5E9',
+                                    'border': 1
+                                })
+                                
+                                # Apply format to columns C and D (excluding header)
+                                if len(df_to_write.columns) >= 4:
+                                    for row_num in range(1, len(df_to_write) + 1):
+                                        worksheet.write(row_num, 2, df_to_write.iloc[row_num-1, 2], highlight_format)
+                                        worksheet.write(row_num, 3, df_to_write.iloc[row_num-1, 3], highlight_format)
+                                
+                                # Adjust column widths
+                                worksheet.set_column('A:A', 30)  # Display Name
+                                worksheet.set_column('B:B', 100)  # Description
+                                worksheet.set_column('C:C', 20)  # SKU
+                                worksheet.set_column('D:D', 25)  # Reason
                         
                         excel_data = output.getvalue()
                         
@@ -507,12 +745,15 @@ def main():
                             use_container_width=True
                         )
                         
-                        st.markdown("""
+                        st.markdown(f"""
                         <div class="success-box">
                         <h4>✅ Ready for Download</h4>
-                        <p>Your processed B2B {} Report is ready. Click the button above to download.</p>
+                        <p>Your processed B2B {st.session_state.report_type} Report is ready with all sheets processed.</p>
+                        <p>Only rows with empty SKU or Reason cells were updated.</p>
                         </div>
-                        """.format(st.session_state.report_type), unsafe_allow_html=True)
+                        """, unsafe_allow_html=True)
+                    else:
+                        st.warning("No sheets could be processed. Please check that your file has SKU and Reason columns in positions C and D.")
             
         except Exception as e:
             st.error(f"Error reading file: {str(e)}")
@@ -523,7 +764,14 @@ def main():
         st.markdown("""
         <div class="warning-box">
         <h4>👆 Upload your Odoo export file to begin</h4>
-        <p>Make sure your file has the required columns: Display Name, Description, SKU, and Reason.</p>
+        <p><strong>Required Format:</strong></p>
+        <ul style="text-align: left;">
+            <li>Excel file (.xlsx or .xls) with one or more sheets</li>
+            <li>Column C must be titled "SKU"</li>
+            <li>Column D must be titled "Reason"</li>
+            <li>Column B should contain the Description</li>
+        </ul>
+        <p style="margin-top: 1rem;">The tool will automatically process all sheets and fill empty cells in columns C & D.</p>
         </div>
         """, unsafe_allow_html=True)
 
