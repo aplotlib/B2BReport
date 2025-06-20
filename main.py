@@ -523,17 +523,7 @@ def process_excel_file_optimized(file, report_type, sheets_to_process):
     
     return all_processed_dfs, total_rows_processed, total_successful
 
-def main():
-    """Main application function"""
-    initialize_session_state()
-    
-    # Header
-    st.markdown("""
-    <div class="main-header">
-        <h1 class="main-title">B2B Report Analyzer</h1>
-        <p class="subtitle">Automated SKU and Reason Extraction from Odoo Support Tickets</p>
-    </div>
-    """, unsafe_allow_html=True)
+def analyze_product_data(all_processed_dfs):
     """Perform comprehensive product analysis on processed data"""
     # Combine all data
     combined_df = pd.concat(all_processed_dfs, ignore_index=True)
@@ -830,6 +820,10 @@ def display_product_analysis(analysis_data, recommendations):
                 )
             else:
                 st.info("No action items to export")
+
+def main():
+    """Main application function"""
+    initialize_session_state()
     
     # Header
     st.markdown("""
