@@ -165,7 +165,8 @@ def initialize_session_state():
         'sheet_scan_results': {},  # Store quick scan results
         'processing_time': 0.0,
         'sheets_to_process': [],
-        'sheets_skipped': []
+        'sheets_skipped': [],
+        'ai_provider': 'auto'  # Default to auto provider selection
     }
     
     for key, value in defaults.items():
@@ -412,16 +413,18 @@ def process_sheet_optimized(df, sheet_name, report_type, ai_handler):
 
 def process_excel_file_optimized(file, report_type, sheets_to_process):
     """Process only sheets that need processing"""
-    # Initialize AI handler
-    ai_handler = None
-    if AI_AVAILABLE and st.session_state.ai_handler is None:
+    # Initialize AI handler with preferred provider
+    ai_handler = st.session_state.ai_handler
+    if AI_AVAILABLE and ai_handler is None:
         try:
-            ai_handler = AIHandler()
+            preferred_provider = st.session_state.get('ai_provider', 'auto')
+            ai_handler = AIHandler(preferred_provider=preferred_provider)
             st.session_state.ai_handler = ai_handler
             
             status = ai_handler.get_status()
             if status['available']:
-                st.success(f"✅ AI Connected: {status['provider']}")
+                active = status.get('active_provider', 'unknown')
+                st.success(f"✅ AI Connected: {active.upper()}")
             else:
                 st.warning("⚠️ AI not available, using pattern matching")
                 ai_handler = None
@@ -509,6 +512,73 @@ def main():
         
         st.markdown("---")
         
+        # AI Provider Selection
+        st.markdown("### 🤖 AI Configuration")
+        
+        # Provider selection
+        ai_provider = st.selectbox(
+            "AI Provider",
+            ["auto", "openai", "claude"],
+            format_func=lambda x: {
+                "auto": "Auto (Best Available)",
+                "openai": "OpenAI (GPT-3.5)",
+                "claude": "Claude (Anthropic)"
+            }.get(x, x),
+            index=["auto", "openai", "claude"].index(st.session_state.ai_provider),
+            help="Choose AI provider or let the system auto-select"
+        )
+        
+        # Update provider if changed
+        if ai_provider != st.session_state.ai_provider:
+            st.session_state.ai_provider = ai_provider
+            if st.session_state.ai_handler:
+                st.session_state.ai_handler.set_preferred_provider(ai_provider)
+                st.rerun()
+        
+        # Show AI status
+        if AI_AVAILABLE and st.session_state.ai_handler:
+            status = st.session_state.ai_handler.get_status()
+            
+            # Available providers
+            if status['available']:
+                st.success(f"Active: {status['active_provider'].upper()}")
+                
+                # Show rate limit warnings
+                if status['rate_limits'].get('claude'):
+                    st.warning("⚠️ Claude: Rate limited")
+                if status['rate_limits'].get('openai'):
+                    st.warning("⚠️ OpenAI: Rate limited")
+            else:
+                st.error("❌ No AI providers available")
+            
+            # Provider statistics
+            with st.expander("📊 Provider Stats", expanded=False):
+                provider_stats = st.session_state.ai_handler.get_provider_stats()
+                
+                for provider, stats in provider_stats.items():
+                    if stats['available']:
+                        st.markdown(f"**{provider.upper()}**")
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.metric("API Calls", stats['calls'])
+                        with col2:
+                            st.metric("Success", f"{stats['success_rate']:.0f}%")
+                        
+                        if stats['errors'] > 0:
+                            st.caption(f"Errors: {stats['errors']}")
+                        if stats['rate_limited']:
+                            st.caption("🚫 Currently rate limited")
+                        st.markdown("---")
+                
+                # Cache stats
+                st.markdown("**Cache Performance**")
+                st.metric("Cache Hits", status['cache_hits'])
+                st.caption(f"Cache size: {status['cache_size']} entries")
+        else:
+            st.info("AI not initialized")
+        
+        st.markdown("---")
+        
         # Performance settings
         st.markdown("### ⚡ Performance Settings")
         
@@ -523,6 +593,12 @@ def main():
             value=True,
             help="Quickly identify sheets that don't need processing"
         )
+        
+        # Clear cache button
+        if st.session_state.ai_handler:
+            if st.button("🗑️ Clear AI Cache", help="Clear cached results to free memory"):
+                st.session_state.ai_handler.clear_cache()
+                st.success("Cache cleared!")
         
         st.markdown("---")
         
@@ -545,6 +621,14 @@ def main():
             - Quick scan identifies sheets needing processing
             - AI extracts SKU and Reason from Description
             - Only empty cells are updated
+            
+            **AI Provider Options:**
+            - **Auto**: Automatically selects best available
+            - **OpenAI**: Fast and reliable (GPT-3.5)
+            - **Claude**: High quality extraction
+            
+            **Note:** If one provider is rate limited, 
+            the system will automatically use the other.
             """)
         
         # Stats
